@@ -2623,6 +2623,7 @@ object DictateController {
         realtimeShownTranscript = ""
         realtimeHandedOver = ""
         realtimeTranscript.setLength(0)
+        runCatching { sink(appContext).clearDictationPreview("") }
         // The floating button always holds the words back, whatever the preference says (#357).
         //
         // Live typing rewrites the field several times a second, and outside our own keyboard that goes
@@ -2640,7 +2641,6 @@ object DictateController {
         // instruction, and typing "make this more formal" into the field only to replace it a moment
         // later shows the user a sentence they never asked to write.
         realtimeHidden = prefs.dictate.realtimeHidePreview.get() ||
-            outputTarget == OutputTarget.OVERLAY ||
             livePromptArmed
         // Read once for the session: a trigger word changed mid-dictation would judge its own first
         // words by one rule and the rest by another.

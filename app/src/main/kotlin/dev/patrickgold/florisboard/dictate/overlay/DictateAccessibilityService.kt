@@ -1067,11 +1067,13 @@ class DictateAccessibilityService : AccessibilityService() {
     }
 
     // --- Real-time dictation preview via the overlay (issue #128) ---------------------------------
-    // Live streaming into another app's field over AccessibilityService. Each accessibility write costs a
-    // node fetch + set, so preview updates are throttled and applied as a minimal diff (delete the changed
-    // tail, insert the new tail) rather than re-setting the whole field. [previewShown] tracks exactly what
-    // we have injected so the diff stays correct even when throttling skips intermediate updates.
+    // Live streaming into another app's field over AccessibilityService. When an InputConnection is bound,
+    // preview updates are applied as a minimal diff. When another IME (e.g. FUTO, Gboard) is active,
+    // currentInputConnection is null; updates are applied via direct single-call ACTION_SET_TEXT using
+    // a snapshot of the pre-dictation field content, avoiding multi-step probing or clipboard fallbacks.
     private var previewShown = ""
+    private var previewBaseText: String? = null
+    private var previewBaseCaret = 0
     private var lastPreviewMs = 0L
 
     /** Returns whether the field took the new tail, so callers only advance [previewShown] when it did. */
@@ -1086,13 +1088,7 @@ class DictateAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Whether live streaming into the focused field is safe at all: only over the input connection.
-     *
-     * Without it, every preview update would rebuild the *entire* field through ACTION_SET_TEXT — once
-     * per word, each time around content that could only be guessed, and each retracted ending going the
-     * same way through [deleteLastTextFromFocused]. That is the machinery of issue #314 running dozens
-     * of times per dictation. The recording is unaffected: the bubble still shows the live text, and the
-     * field gets one insert at the end, which is the path that is actually verified.
+     * Whether live streaming into the focused field is safe over the input connection.
      */
     private fun canStreamIntoField(): Boolean =
         inputConnectionUsable() &&
@@ -1100,35 +1096,122 @@ class DictateAccessibilityService : AccessibilityService() {
 
     private fun setPreviewThrottled(full: String) {
         if (full == previewShown) return
-        if (!canStreamIntoField()) return
         val now = SystemClock.uptimeMillis()
         if (now - lastPreviewMs < PREVIEW_THROTTLE_MS) return   // skip; a later update catches up via the diff
-        // Only move the diff base when the write landed (issue #277). Advancing it regardless left the
-        // base describing text that was never inserted, and every later diff was computed against that
-        // fiction — so one refused write desynchronised the whole rest of the streaming session.
-        if (applyPreviewDiff(previewShown, full)) previewShown = full
+
+        if (canStreamIntoField()) {
+            if (applyPreviewDiff(previewShown, full)) previewShown = full
+            lastPreviewMs = now
+            return
+        }
+
+        val target = dictationTarget() ?: return
+        target.refresh()
+
+        if (previewBaseText == null) {
+            val raw = target.editableText()
+            val selStart = target.textSelectionStart
+            val selEnd = target.textSelectionEnd
+            val selFrom = minOf(selStart, selEnd).coerceIn(0, raw.length)
+            val selTo = maxOf(selStart, selEnd).coerceIn(0, raw.length)
+            if (selStart >= 0 && selEnd >= 0 && selFrom < selTo) {
+                previewBaseText = raw.removeRange(selFrom, selTo)
+                previewBaseCaret = selFrom
+            } else if (selStart >= 0 && selEnd >= 0) {
+                previewBaseText = raw
+                previewBaseCaret = selFrom
+            } else {
+                previewBaseText = raw
+                previewBaseCaret = raw.length
+            }
+        }
+
+        val base = previewBaseText ?: ""
+        val caret = previewBaseCaret.coerceIn(0, base.length)
+        val newFieldText = base.substring(0, caret) + full + base.substring(caret)
+
+        val setArgs = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newFieldText)
+        }
+        val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+        if (ok) {
+            previewShown = full
+            val newCursor = (caret + full.length).coerceIn(0, newFieldText.length)
+            val selArgs = Bundle().apply {
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursor)
+                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursor)
+            }
+            target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+        }
         lastPreviewMs = now
     }
 
     /**
-     * The finished realtime transcript, unthrottled and **verified** like a batch insert.
-     *
-     * The comment in [applyPreviewDiff] always promised that the final commit is the verified one, but it
-     * went through that same unverified write. Over the floating button that write is the whole dictation
-     * — the preview is always held back there — so an input connection that swallowed it (seen in AOSP
-     * Messaging, issue #443's investigation) ended in a green check over an unchanged field, while a batch
-     * dictation into the same field noticed and recovered through the node.
+     * The finished realtime transcript, unthrottled and verified like a batch insert.
      */
     private fun commitPreviewFinalOnFocused(finalText: String): Boolean {
-        val landed = applyPreviewDiff(previewShown, finalText, verify = true)
-        previewShown = ""
-        lastPreviewMs = 0L
-        return landed
+        val base = previewBaseText
+        val caret = previewBaseCaret
+        val hadOverlayPreview = base != null
+        val prevShown = previewShown
+        resetPreviewState()
+
+        if (hadOverlayPreview) {
+            val target = dictationTarget()
+            if (target != null) {
+                target.refresh()
+                val safeCaret = caret.coerceIn(0, base!!.length)
+                val finalFieldText = base.substring(0, safeCaret) + finalText + base.substring(safeCaret)
+                val setArgs = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, finalFieldText)
+                }
+                val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+                if (ok) {
+                    val newCursor = (safeCaret + finalText.length).coerceIn(0, finalFieldText.length)
+                    val selArgs = Bundle().apply {
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursor)
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursor)
+                    }
+                    target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+                    logCommit("overlayStreamFinal", "snapshot", finalText.length)
+                    return true
+                }
+            }
+            return commitTextIntoFocused(finalText, verify = true)
+        }
+
+        return applyPreviewDiff(prevShown, finalText, verify = true)
     }
 
     private fun clearPreviewOnFocused() {
-        if (previewShown.isNotEmpty()) applyPreviewDiff(previewShown, "")
+        val base = previewBaseText
+        val caret = previewBaseCaret
+        val hadOverlayPreview = base != null
+        val prevShown = previewShown
+        resetPreviewState()
+
+        if (hadOverlayPreview) {
+            val target = dictationTarget()
+            if (target != null) {
+                val setArgs = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, base!!)
+                }
+                target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+                val selArgs = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, caret)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, caret)
+                }
+                target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+            }
+        } else if (prevShown.isNotEmpty()) {
+            applyPreviewDiff(prevShown, "")
+        }
+    }
+
+    private fun resetPreviewState() {
         previewShown = ""
+        previewBaseText = null
+        previewBaseCaret = 0
         lastPreviewMs = 0L
     }
 
@@ -1260,6 +1343,7 @@ class DictateAccessibilityService : AccessibilityService() {
             bubble = null
             mainHandler.removeCallbacksAndMessages(null)
             stopMicForeground()
+            resetPreviewState()
             flogDebug { "DictateAccessibilityService disconnected" }
         }
     }
